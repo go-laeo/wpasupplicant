@@ -29,17 +29,18 @@
 package wpasupplicant
 
 import (
-	"bufio"
 	"bytes"
+	"context"
+	"encoding/hex"
+	"errors"
 	"fmt"
-	"io"
-	"io/ioutil"
 	"net"
 	"os"
 	"path"
 	"strconv"
 	"strings"
-	"syscall"
+	"sync"
+	"time"
 )
 
 // message is a queued response (or read error) from the wpa_supplicant
@@ -50,52 +51,52 @@ type message struct {
 	err      error
 }
 
-// unixgramConn is the implementation of Conn for the AF_UNIX SOCK_DGRAM
+// unixgram is the implementation of Conn for the AF_UNIX SOCK_DGRAM
 // control interface.
 //
 // See https://w1.fi/wpa_supplicant/devel/ctrl_iface_page.html.
-type unixgramConn struct {
-	c                      *net.UnixConn
-	fd                     uintptr
+type unixgram struct {
+	ctx                    context.Context
+	local, remote          string
+	conn                   *net.UnixConn
 	solicited, unsolicited chan message
 	wpaEvents              chan WPAEvent
+	lock                   sync.Mutex
 }
 
-// socketPath is where to find the the AF_UNIX sockets for each interface.  It
-// can be overridden for testing.
-var socketPath = "/run/wpa_supplicant"
-
-// Unixgram returns a connection to wpa_supplicant for the specified
+// Connect returns a connection to wpa_supplicant for the specified
 // interface, using the socket-based control interface.
-func Unixgram(ifName string) (Conn, error) {
+func Connect(ctx context.Context, iface string, options ...Option) (Conn, error) {
+	return ConnectPath(ctx, stdSocketPath, iface, options...)
+}
+
+// ConnectPath connects to iface within ctrlPath and returns a connection.
+func ConnectPath(ctx context.Context, ctrlPath string, iface string, options ...Option) (Conn, error) {
 	var err error
-	uc := &unixgramConn{}
+	uc := &unixgram{
+		ctx:         ctx,
+		solicited:   make(chan message),
+		unsolicited: make(chan message),
+		wpaEvents:   make(chan WPAEvent),
+	}
 
-	local, err := ioutil.TempFile("/tmp", "wpa_supplicant")
+	local, err := createLocalPath(iface)
 	if err != nil {
 		return nil, err
 	}
-	os.Remove(local.Name())
 
-	uc.c, err = net.DialUnix("unixgram",
-		&net.UnixAddr{Name: local.Name(), Net: "unixgram"},
-		&net.UnixAddr{Name: path.Join(socketPath, ifName), Net: "unixgram"})
-	if err != nil {
-		return nil, err
+	defaults := []Option{CustomUnixgram(local, path.Join(ctrlPath, iface))}
+	defaults = append(defaults, options...)
+
+	for _, fn := range defaults {
+		if err = fn(uc); err != nil {
+			return nil, err
+		}
 	}
-
-	file, err := uc.c.File()
-	if err != nil {
-		return nil, err
-	}
-	uc.fd = file.Fd()
-
-	uc.solicited = make(chan message)
-	uc.unsolicited = make(chan message)
-	uc.wpaEvents = make(chan WPAEvent)
 
 	go uc.readLoop()
 	go uc.readUnsolicited()
+
 	// Issue an ATTACH command to start receiving unsolicited events.
 	err = uc.runCommand("ATTACH")
 	if err != nil {
@@ -108,58 +109,51 @@ func Unixgram(ifName string) (Conn, error) {
 // readLoop is spawned after we connect.  It receives messages from the
 // socket, and routes them to the appropriate channel based on whether they
 // are solicited (in response to a request) or unsolicited.
-func (uc *unixgramConn) readLoop() {
+func (uc *unixgram) readLoop() {
+	buf := make([]byte, 2048)
 	for {
-		// The syscall below will block until a datagram is received.
-		// It uses a zero-length buffer to look at the datagram
-		// without discarding it (MSG_PEEK), returning the actual
-		// datagram size (MSG_TRUNC).  See the recvfrom(2) man page.
-		//
-		// The actual read occurs using UnixConn.Read(), once we've
-		// allocated an appropriately-sized buffer.
-		n, _, err := syscall.Recvfrom(int(uc.fd), []byte{}, syscall.MSG_PEEK|syscall.MSG_TRUNC)
-		if err != nil {
-			// Treat read errors as a response to whatever command
-			// was last issued.
-			uc.solicited <- message{
-				err: err,
+		select {
+		case <-uc.ctx.Done():
+			return
+		default:
+			b, oob := make([]byte, 2048), make([]byte, 2048)
+			n, oobn, _, _, err := uc.conn.ReadMsgUnix(b, oob)
+			if err != nil {
+				uc.solicited <- message{
+					err: err,
+				}
+				continue
 			}
-			continue
-		}
 
-		buf := make([]byte, n)
-		_, err = uc.c.Read(buf[:])
-		if err != nil {
-			uc.solicited <- message{
-				err: err,
-			}
-			continue
-		}
+			// rebuild data buffer
+			b = append(buf, b[:n]...)
+			buf = oob[:oobn]
 
-		// Unsolicited messages are preceded by a priority
-		// specification, e.g. "<1>message".  If there's no priority,
-		// default to 2 (info) and assume it's the response to
-		// whatever command was last issued.
-		var p int
-		var c chan message
-		if len(buf) >= 3 && buf[0] == '<' && buf[2] == '>' {
-			switch buf[1] {
-			case '0', '1', '2', '3', '4':
-				c = uc.unsolicited
-				p, _ = strconv.Atoi(string(buf[1]))
-				buf = buf[3:]
-			default:
+			// Unsolicited messages are preceded by a priority
+			// specification, e.g. "<1>message".  If there's no priority,
+			// default to 2 (info) and assume it's the response to
+			// whatever command was last issued.
+			var p int
+			var c chan message
+			if len(b) >= 3 && b[0] == '<' && b[2] == '>' {
+				switch b[1] {
+				case '0', '1', '2', '3', '4':
+					c = uc.unsolicited
+					p, _ = strconv.Atoi(string(b[1]))
+					b = b[3:]
+				default:
+					c = uc.solicited
+					p = 2
+				}
+			} else {
 				c = uc.solicited
 				p = 2
 			}
-		} else {
-			c = uc.solicited
-			p = 2
-		}
 
-		c <- message{
-			priority: p,
-			data:     buf,
+			c <- message{
+				priority: p,
+				data:     b,
+			}
 		}
 	}
 }
@@ -167,49 +161,58 @@ func (uc *unixgramConn) readLoop() {
 // readUnsolicited handles messages sent to the unsolicited channel and parse them
 // into a WPAEvent. At the moment we only handle `CTRL-EVENT-*` events and only events
 // where the 'payload' is formatted with key=val.
-func (uc *unixgramConn) readUnsolicited() {
+func (uc *unixgram) readUnsolicited() {
 	for {
-		mgs := <-uc.unsolicited
-		data := bytes.NewBuffer(mgs.data).String()
+		select {
+		case <-uc.ctx.Done():
+			return
+		default:
+			mgs := <-uc.unsolicited
+			data := bytes.NewBuffer(mgs.data).String()
 
-		parts := strings.Split(data, " ")
-		if len(parts) == 0 {
-			continue
-		}
-
-		if strings.Index(parts[0], "CTRL-") != 0 {
-			uc.wpaEvents <- WPAEvent{
-				Event: "MESSAGE",
-				Line:  data,
+			parts := strings.Split(data, " ")
+			if len(parts) == 0 {
+				continue
 			}
-			continue
-		}
 
-		event := WPAEvent{
-			Event:     strings.TrimPrefix(parts[0], "CTRL-EVENT-"),
-			Arguments: make(map[string]string),
-			Line:      data,
-		}
-
-		for _, args := range parts[1:] {
-			if strings.Contains(args, "=") {
-				keyval := strings.Split(args, "=")
-				if len(keyval) != 2 {
-					continue
+			var e WPAEvent
+			if strings.Index(parts[0], "CTRL-") != 0 {
+				e = WPAEvent{
+					Event: "MESSAGE",
+					Line:  data,
 				}
-				event.Arguments[keyval[0]] = keyval[1]
+			} else {
+				e = WPAEvent{
+					Event:     strings.TrimPrefix(parts[0], "CTRL-EVENT-"),
+					Arguments: make(map[string]string),
+					Line:      data,
+				}
+
+				for _, args := range parts[1:] {
+					if strings.Contains(args, "=") {
+						keyval := strings.Split(args, "=")
+						if len(keyval) != 2 {
+							continue
+						}
+						e.Arguments[keyval[0]] = keyval[1]
+					}
+				}
+			}
+
+			select {
+			case uc.wpaEvents <- e:
+			case <-time.After(time.Millisecond):
 			}
 		}
-
-		uc.wpaEvents <- event
 	}
 }
 
 // cmd executes a command and waits for a reply.
-func (uc *unixgramConn) cmd(cmd string) ([]byte, error) {
-	// TODO: block if any other commands are running
+func (uc *unixgram) cmd(cmd string) ([]byte, error) {
+	uc.lock.Lock()
+	defer uc.lock.Unlock()
 
-	_, err := uc.c.Write([]byte(cmd))
+	_, err := uc.conn.Write([]byte(cmd))
 	if err != nil {
 		return nil, err
 	}
@@ -218,57 +221,38 @@ func (uc *unixgramConn) cmd(cmd string) ([]byte, error) {
 	return msg.data, msg.err
 }
 
-// ParseError is returned when we can't parse the wpa_supplicant response.
-// Some functions may return multiple ParseErrors.
-type ParseError struct {
-	// Line is the line of output from wpa_supplicant which we couldn't
-	// parse.
-	Line string
-
-	// Err is any nested error.
-	Err error
-}
-
-func (err *ParseError) Error() string {
-	b := &bytes.Buffer{}
-	b.WriteString("failed to parse wpa_supplicant response")
-
-	if err.Line != "" {
-		fmt.Fprintf(b, ": %q", err.Line)
-	}
-
-	if err.Err != nil {
-		fmt.Fprintf(b, ": %s", err.Err.Error())
-	}
-
-	return b.String()
-}
-
-func (uc *unixgramConn) EventQueue() chan WPAEvent {
-	return uc.wpaEvents
-}
-
-func (uc *unixgramConn) Close() error {
-	if err := uc.runCommand("DETACH"); err != nil {
+// runCommand is a wrapper around the uc.cmd command which makes sure the
+// command returned a successful (OK) response.
+func (uc *unixgram) runCommand(cmd string) error {
+	resp, err := uc.cmd(cmd)
+	if err != nil {
 		return err
 	}
 
-	return uc.c.Close()
+	if bytes.Equal(resp, []byte("OK\n")) {
+		return nil
+	}
+
+	return &ParseError{Line: string(resp)}
 }
 
-func (uc *unixgramConn) Ping() error {
+func (uc *unixgram) EventQueue() chan WPAEvent {
+	return uc.wpaEvents
+}
+
+func (uc *unixgram) Ping() error {
 	resp, err := uc.cmd("PING")
 	if err != nil {
 		return err
 	}
 
-	if bytes.Compare(resp, []byte("PONG\n")) == 0 {
+	if bytes.Equal(resp, []byte("PONG\n")) {
 		return nil
 	}
 	return &ParseError{Line: string(resp)}
 }
 
-func (uc *unixgramConn) AddNetwork() (int, error) {
+func (uc *unixgram) AddNetwork() (int, error) {
 	resp, err := uc.cmd("ADD_NETWORK")
 	if err != nil {
 		return -1, err
@@ -278,64 +262,83 @@ func (uc *unixgramConn) AddNetwork() (int, error) {
 	return strconv.Atoi(strings.Trim(b.String(), "\n"))
 }
 
-func (uc *unixgramConn) EnableNetwork(networkID int) error {
+func (uc *unixgram) EnableNetwork(networkID int) error {
 	return uc.runCommand(fmt.Sprintf("ENABLE_NETWORK %d", networkID))
 }
 
-func (uc *unixgramConn) EnableAllNetworks() error {
+func (uc *unixgram) EnableAllNetworks() error {
 	return uc.runCommand("ENABLE_NETWORK all")
 }
 
-func (uc *unixgramConn) SelectNetwork(networkID int) error {
+func (uc *unixgram) SelectNetwork(networkID int) error {
 	return uc.runCommand(fmt.Sprintf("SELECT_NETWORK %d", networkID))
 }
 
-func (uc *unixgramConn) DisableNetwork(networkID int) error {
+func (uc *unixgram) DisableNetwork(networkID int) error {
 	return uc.runCommand(fmt.Sprintf("DISABLE_NETWORK %d", networkID))
 }
 
-func (uc *unixgramConn) RemoveNetwork(networkID int) error {
+func (uc *unixgram) RemoveNetwork(networkID int) error {
 	return uc.runCommand(fmt.Sprintf("REMOVE_NETWORK %d", networkID))
 }
 
-func (uc *unixgramConn) RemoveAllNetworks() error {
+func (uc *unixgram) RemoveAllNetworks() error {
 	return uc.runCommand("REMOVE_NETWORK all")
 }
 
-func (uc *unixgramConn) SetNetwork(networkID int, variable string, value string) error {
-	var cmd string
+func (uc *unixgram) SetNetwork(networkID int, variable string, value interface{}) error {
+	b := strings.Builder{}
+	b.WriteString("SET_NETWORK")
+	b.WriteString(" ")
+	b.WriteString(strconv.Itoa(networkID))
+	b.WriteString(" ")
+	b.WriteString(variable)
+	b.WriteString(" ")
 
 	// Since key_mgmt expects the value to not be wrapped in "" we do a little check here.
-	if variable == "key_mgmt" {
-		cmd = fmt.Sprintf("SET_NETWORK %d %s %s", networkID, variable, value)
-	} else {
-		cmd = fmt.Sprintf("SET_NETWORK %d %s \"%s\"", networkID, variable, value)
+	// Update: since we have to support AP mode, we need to support integer value (and hex value that just for non-ascii ssid)
+	switch v := value.(type) {
+	case string:
+		switch variable {
+		case "key_mgmt":
+			b.WriteString(v)
+		default:
+			b.WriteString("\"")
+			b.WriteString(v)
+			b.WriteString("\"")
+		}
+	case int:
+		b.WriteString(strconv.Itoa(v))
+	case []byte:
+		b.WriteString(hex.EncodeToString(v))
+	default:
+		return errors.New("unsupported value type")
 	}
 
-	return uc.runCommand(cmd)
+	return uc.runCommand(b.String())
 }
 
-func (uc *unixgramConn) SaveConfig() error {
+func (uc *unixgram) SaveConfig() error {
 	return uc.runCommand("SAVE_CONFIG")
 }
 
-func (uc *unixgramConn) Reconfigure() error {
+func (uc *unixgram) Reconfigure() error {
 	return uc.runCommand("RECONFIGURE")
 }
 
-func (uc *unixgramConn) Reassociate() error {
+func (uc *unixgram) Reassociate() error {
 	return uc.runCommand("REASSOCIATE")
 }
 
-func (uc *unixgramConn) Reconnect() error {
+func (uc *unixgram) Reconnect() error {
 	return uc.runCommand("RECONNECT")
 }
 
-func (uc *unixgramConn) Scan() error {
+func (uc *unixgram) Scan() error {
 	return uc.runCommand("SCAN")
 }
 
-func (uc *unixgramConn) ScanResults() ([]ScanResult, []error) {
+func (uc *unixgram) ScanResults() ([]ScanResult, []error) {
 	resp, err := uc.cmd("SCAN_RESULTS")
 	if err != nil {
 		return nil, []error{err}
@@ -344,7 +347,7 @@ func (uc *unixgramConn) ScanResults() ([]ScanResult, []error) {
 	return parseScanResults(bytes.NewBuffer(resp))
 }
 
-func (uc *unixgramConn) Status() (StatusResult, error) {
+func (uc *unixgram) Status() (StatusResult, error) {
 	resp, err := uc.cmd("STATUS")
 	if err != nil {
 		return nil, err
@@ -353,7 +356,7 @@ func (uc *unixgramConn) Status() (StatusResult, error) {
 	return parseStatusResults(bytes.NewBuffer(resp))
 }
 
-func (uc *unixgramConn) ListNetworks() ([]ConfiguredNetwork, error) {
+func (uc *unixgram) ListNetworks() ([]ConfiguredNetwork, error) {
 	resp, err := uc.cmd("LIST_NETWORKS")
 	if err != nil {
 		return nil, err
@@ -362,197 +365,12 @@ func (uc *unixgramConn) ListNetworks() ([]ConfiguredNetwork, error) {
 	return parseListNetworksResult(bytes.NewBuffer(resp))
 }
 
-// runCommand is a wrapper around the uc.cmd command which makes sure the
-// command returned a successful (OK) response.
-func (uc *unixgramConn) runCommand(cmd string) error {
-	resp, err := uc.cmd(cmd)
-	if err != nil {
+func (uc *unixgram) Close() error {
+	defer os.Remove(uc.local)
+
+	if err := uc.runCommand("DETACH"); err != nil {
 		return err
 	}
 
-	if bytes.Compare(resp, []byte("OK\n")) == 0 {
-		return nil
-	}
-
-	return &ParseError{Line: string(resp)}
-}
-
-func parseListNetworksResult(resp io.Reader) (res []ConfiguredNetwork, err error) {
-	s := bufio.NewScanner(resp)
-	if !s.Scan() {
-		return nil, &ParseError{}
-	}
-
-	networkIDCol, ssidCol, bssidCol, flagsCol, maxCol := -1, -1, -1, -1, -1
-	for n, col := range strings.Split(s.Text(), " / ") {
-		switch col {
-		case "network id":
-			networkIDCol = n
-		case "ssid":
-			ssidCol = n
-		case "bssid":
-			bssidCol = n
-		case "flags":
-			flagsCol = n
-		}
-
-		maxCol = n
-	}
-
-	for s.Scan() {
-		ln := s.Text()
-		fields := strings.Split(ln, "\t")
-		if len(fields) < maxCol {
-			return nil, &ParseError{Line: ln}
-		}
-
-		var networkID string
-		if networkIDCol != -1 {
-			networkID = fields[networkIDCol]
-		}
-
-		var ssid string
-		if ssidCol != -1 {
-			ssid = fields[ssidCol]
-		}
-
-		var bssid string
-		if bssidCol != -1 {
-			bssid = fields[bssidCol]
-		}
-
-		var flags []string
-		if flagsCol != -1 {
-			if len(fields[flagsCol]) >= 2 && fields[flagsCol][0] == '[' && fields[flagsCol][len(fields[flagsCol])-1] == ']' {
-				flags = strings.Split(fields[flagsCol][1:len(fields[flagsCol])-1], "][")
-			}
-		}
-
-		res = append(res, &configuredNetwork{
-			networkID: networkID,
-			ssid:      ssid,
-			bssid:     bssid,
-			flags:     flags,
-		})
-	}
-
-	return res, nil
-}
-
-func parseStatusResults(resp io.Reader) (StatusResult, error) {
-	s := bufio.NewScanner(resp)
-
-	res := &statusResult{}
-
-	for s.Scan() {
-		ln := s.Text()
-		fields := strings.Split(ln, "=")
-		if len(fields) != 2 {
-			continue
-		}
-
-		switch fields[0] {
-		case "wpa_state":
-			res.wpaState = fields[1]
-		case "key_mgmt":
-			res.keyMgmt = fields[1]
-		case "ip_address":
-			res.ipAddr = fields[1]
-		case "ssid":
-			res.ssid = fields[1]
-		case "address":
-			res.address = fields[1]
-		case "bssid":
-			res.bssid = fields[1]
-		case "freq":
-			res.freq = fields[1]
-		}
-	}
-
-	return res, nil
-}
-
-// parseScanResults parses the SCAN_RESULTS output from wpa_supplicant.  This
-// is split out from ScanResults() to make testing easier.
-func parseScanResults(resp io.Reader) (res []ScanResult, errs []error) {
-	// In an attempt to make our parser more resilient, we start by
-	// parsing the header line and using that to determine the column
-	// order.
-	s := bufio.NewScanner(resp)
-	if !s.Scan() {
-		errs = append(errs, &ParseError{})
-		return
-	}
-	bssidCol, freqCol, rssiCol, flagsCol, ssidCol, maxCol := -1, -1, -1, -1, -1, -1
-	for n, col := range strings.Split(s.Text(), " / ") {
-		switch col {
-		case "bssid":
-			bssidCol = n
-		case "frequency":
-			freqCol = n
-		case "signal level":
-			rssiCol = n
-		case "flags":
-			flagsCol = n
-		case "ssid":
-			ssidCol = n
-		}
-		maxCol = n
-	}
-
-	var err error
-	for s.Scan() {
-		ln := s.Text()
-		fields := strings.Split(ln, "\t")
-		if len(fields) < maxCol {
-			errs = append(errs, &ParseError{Line: ln})
-			continue
-		}
-
-		var bssid net.HardwareAddr
-		if bssidCol != -1 {
-			if bssid, err = net.ParseMAC(fields[bssidCol]); err != nil {
-				errs = append(errs, &ParseError{Line: ln, Err: err})
-				continue
-			}
-		}
-
-		var freq int
-		if freqCol != -1 {
-			if freq, err = strconv.Atoi(fields[freqCol]); err != nil {
-				errs = append(errs, &ParseError{Line: ln, Err: err})
-				continue
-			}
-		}
-
-		var rssi int
-		if rssiCol != -1 {
-			if rssi, err = strconv.Atoi(fields[rssiCol]); err != nil {
-				errs = append(errs, &ParseError{Line: ln, Err: err})
-				continue
-			}
-		}
-
-		var flags []string
-		if flagsCol != -1 {
-			if len(fields[flagsCol]) >= 2 && fields[flagsCol][0] == '[' && fields[flagsCol][len(fields[flagsCol])-1] == ']' {
-				flags = strings.Split(fields[flagsCol][1:len(fields[flagsCol])-1], "][")
-			}
-		}
-
-		var ssid string
-		if ssidCol != -1 {
-			ssid = fields[ssidCol]
-		}
-
-		res = append(res, &scanResult{
-			bssid:     bssid,
-			frequency: freq,
-			rssi:      rssi,
-			flags:     flags,
-			ssid:      ssid,
-		})
-	}
-
-	return
+	return uc.conn.Close()
 }

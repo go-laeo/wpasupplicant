@@ -1,8 +1,6 @@
-# pifke.org/wpasupplicant
+# wpasupplicant
 
-[![GoDoc](https://godoc.org/pifke.org/wpasupplicant?status.svg)](https://godoc.org/pifke.org/wpasupplicant)
-[![Build Status](https://api.travis-ci.org/dpifke/golang-wpasupplicant.svg)](https://travis-ci.org/dpifke/golang-wpasupplicant)
-[![Test Coverage](https://coveralls.io/repos/github/dpifke/golang-wpasupplicant/badge.svg)](https://coveralls.io/github/dpifke/golang-wpasupplicant)
+![build.yaml](https://github.com/go-laeo/wpasupplicant/actions/workflows/build.yaml/badge.svg) [![Go Reference](https://pkg.go.dev/badge/github.com/go-laeo/wpasupplicant.svg)](https://pkg.go.dev/github.com/go-laeo/wpasupplicant) ![golangci.yaml](https://github.com/go-laeo/wpasupplicant/actions/workflows/golangci-lint.yaml/badge.svg)
 
 Golang interface for talking to wpa_supplicant.
 
@@ -15,7 +13,7 @@ results.  More functionality (probably) coming soon.
 import (
 	"fmt"
 
-	"pifke.org/wpasupplicant"
+	"github.com/go-laeo/wpasupplicant"
 )
 
 // Prints the BSSID (MAC address) and SSID of each access point in range:
@@ -34,21 +32,21 @@ If you use this library in your own code, please use the canonical URL in your
 Go code, instead of Github:
 
 ```
-go get pifke.org/wpasupplicant
+go get github.com/go-laeo/wpasupplicant
 ```
 
 Or (until I finish setting up the self-hosted repository):
 
 ```
 # From the root of your project:
-git submodule add https://github.com/dpifke/golang-wpasupplicant vendor/pifke.org/wpasupplicant
+git submodule add https://github.com/dpifke/golang-wpasupplicant vendor/github.com/go-laeo/wpasupplicant
 ```
 
 Then:
 
 ```
 import (
-        "pifke.org/wpasupplicant"
+        "github.com/go-laeo/wpasupplicant"
 )
 ```
 
@@ -57,7 +55,7 @@ will exist or be up-to-date in the future.
 
 ## Documentation
 
-Available on [godoc.org](https://godoc.org/pifke.org/wpasupplicant).
+Available on [godoc.org](https://godoc.org/github.com/go-laeo/wpasupplicant).
 
 ## License
 
@@ -65,9 +63,6 @@ Three-clause BSD.  See LICENSE.txt.
 
 Contact me if you want to use this code under different terms.
 
-## Author
+## Thanks
 
-Dave Pifke.  My email address is my first name "at" my last name "dot org."
-
-I'm [@dpifke](https://twitter.com/dpifke) on Twitter.  My PGP key
-is available on [Keybase](https://keybase.io/dpifke).
+* [@Dave Pifke](https://github.com/dpifke/golang-wpasupplicant)
