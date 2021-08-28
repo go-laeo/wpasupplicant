@@ -64,6 +64,8 @@ type unixgram struct {
 	lock                   sync.Mutex
 }
 
+var _ Conn = (*unixgram)(nil)
+
 // Connect returns a connection to wpa_supplicant for the specified
 // interface, using the socket-based control interface.
 func Connect(ctx context.Context, iface string, options ...Option) (Conn, error) {
